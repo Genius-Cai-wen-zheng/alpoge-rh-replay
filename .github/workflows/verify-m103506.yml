@@ -1,0 +1,85 @@
+name: Verify M103506
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      MODULE: Development.AutomorphicArithmetic.AutomorphicVarieties.GaloisLibrary.FerreroWashingtonIndex.TwSingle
+      TARGET: M103506
+    steps:
+      - name: Confirm the upstream reservation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          issue=repos/rohanarun/alpoge-rh-replay/issues/126
+          gh api "$issue" | jq -e --arg owner "$GITHUB_REPOSITORY_OWNER" '(.user.login == $owner) and (.state == "open") and (.title == "Claim M103506") and any(.labels[]; .name == "claim-granted")'
+          gh api "$issue/comments" | jq -e 'any(.[]; .user.login == "github-actions[bot]" and (.body | startswith("Granted `M103506`.")))'
+
+      - name: Check out pinned upstream verification tools
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: rohanarun/alpoge-rh-replay
+          ref: 8ad01444ca1e05f82ca4497795a697ed7fa8a352
+          persist-credentials: false
+
+      - name: Prepare the official release and pinned Mathlib
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/launcher" "$RUNNER_TEMP/evidence"
+          cd "$RUNNER_TEMP/launcher"
+          curl -fsSL --retry 4 -o elan.tar.gz https://github.com/leanprover/elan/releases/download/v4.4.0/elan-x86_64-unknown-linux-gnu.tar.gz
+          echo '0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2  elan.tar.gz' | sha256sum --check
+          tar -xzf elan.tar.gz
+          ELAN_HOME="$RUNNER_TEMP/launcher/home" ./elan-init -y --no-modify-path --default-toolchain none
+          export PATH="$RUNNER_TEMP/launcher/home/bin:$PATH"
+          echo "$RUNNER_TEMP/launcher/home/bin" >> "$GITHUB_PATH"
+          cd "$GITHUB_WORKSPACE"
+          bash ./verify.sh "$RUNNER_TEMP/replay" --prepare-only
+          cd "$RUNNER_TEMP/replay/parts"
+          sha256sum -c "$GITHUB_WORKSPACE/parts.sha256" > "$RUNNER_TEMP/evidence/archive-checks.log"
+
+      - name: Build just the claimed target and record build resources
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          cd "$GITHUB_WORKSPACE"
+          python3 tracker/tasks.py show "$TARGET" > "$evidence/module.json"
+          project="$RUNNER_TEMP/replay/lean"
+          cd "$project/src"
+          printf '%s  %s.lean\n' "$(jq -r .source_sha256 "$evidence/module.json")" "${MODULE//./\/}" > "$evidence/source.sha256"
+          sha256sum -c "$evidence/source.sha256"
+          cd "$GITHUB_WORKSPACE"
+          {
+            echo "build_started=$(date -u +%FT%TZ)"
+            uname -sm
+            nproc
+            free -h
+            df -h "$RUNNER_TEMP"
+          } > "$evidence/resources.log"
+          /usr/bin/time -v -o "$evidence/time.log" python3 tracker/tasks.py build "$TARGET" "$project" "$evidence/receipt" --bundle
+          echo "build_ended=$(date -u +%FT%TZ)" >> "$evidence/resources.log"
+
+      - name: Replay the target module in the Lean kernel and print theorem axioms
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/replay/lean"
+          export ELAN_HOME="$RUNNER_TEMP/replay/elan" XDG_CACHE_HOME="$RUNNER_TEMP/replay/cache"
+          evidence="$RUNNER_TEMP/evidence"
+          launcher=(elan run leanprover/lean4:v4.33.1 lake)
+          "${launcher[@]}" env leanchecker --verbose "$MODULE" 2>&1 | tee "$evidence/kernel.log"
+          printf 'import %s\n#print axioms UpperTheory.V.FW.tw_single\n' "$MODULE" > "$evidence/Audit.lean"
+          "${launcher[@]}" env lean "$evidence/Audit.lean" 2>&1 | tee "$evidence/axioms.log"
+          echo "checks_ended=$(date -u +%FT%TZ)" >> "$evidence/resources.log"
+
+      - name: Upload verification records
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: M103506-evidence
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 7
+          if-no-files-found: warn
