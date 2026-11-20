@@ -1,0 +1,110 @@
+name: Verify a granted packet
+run-name: Verify ${{ inputs.packet }} for claim ${{ inputs.issue }}
+on:
+  workflow_dispatch:
+    inputs:
+      packet:
+        description: Packet ID
+        required: true
+        type: choice
+        options:
+          - P1582
+          - P1612
+          - P1554
+      issue:
+        description: Upstream claim issue number
+        required: true
+        type: string
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 350
+    env:
+      TARGET: ${{ inputs.packet }}
+      ISSUE_NUMBER: ${{ inputs.issue }}
+    steps:
+      - name: Confirm the upstream reservation
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$ISSUE_NUMBER" =~ ^[0-9]+$ && "$TARGET" =~ ^P[0-9]{4}$ ]]
+          issue="repos/rohanarun/alpoge-rh-replay/issues/$ISSUE_NUMBER"
+          gh api "$issue" | jq -e --arg title "Claim $TARGET" --arg owner "$GITHUB_REPOSITORY_OWNER" '(.user.login == $owner) and (.state == "open") and (.title == $title) and any(.labels[]; .name == "claim-granted")'
+          gh api --paginate --slurp "$issue/comments?per_page=100" | jq -e --arg packet "$TARGET" 'any(.[][]; .user.login == "github-actions[bot]" and (.body | startswith("Granted `" + $packet + "`." )))'
+
+      - name: Check out pinned upstream verification tools
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          repository: rohanarun/alpoge-rh-replay
+          ref: 4fcc96a44992b6b75cd3cc3e4ee8c5b71fe12ec2
+          persist-credentials: false
+
+      - name: Prepare the official release and pinned Mathlib
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/launcher" "$RUNNER_TEMP/evidence"
+          cd "$RUNNER_TEMP/launcher"
+          curl -fsSL --retry 4 -o elan.tar.gz https://github.com/leanprover/elan/releases/download/v4.4.0/elan-x86_64-unknown-linux-gnu.tar.gz
+          echo '0e8250aa2be86c7af929ade68db617af9edc8b9ccf6eaf5ece228250d0d032e2  elan.tar.gz' | sha256sum --check
+          tar -xzf elan.tar.gz
+          ELAN_HOME="$RUNNER_TEMP/launcher/home" ./elan-init -y --no-modify-path --default-toolchain none
+          export PATH="$RUNNER_TEMP/launcher/home/bin:$PATH"
+          echo "$RUNNER_TEMP/launcher/home/bin" >> "$GITHUB_PATH"
+          cd "$GITHUB_WORKSPACE"
+          bash ./verify.sh "$RUNNER_TEMP/replay" --prepare-only
+          cd "$RUNNER_TEMP/replay/parts"
+          sha256sum -c "$GITHUB_WORKSPACE/parts.sha256" > "$RUNNER_TEMP/evidence/archive-checks.log"
+
+      - name: Check the complete packet against all 64 source digests
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          python3 tracker/tasks.py show "$TARGET" > "$evidence/packet.jsonl"
+          jq -s -e --arg packet "$TARGET" 'length == 64 and ([.[].id] | unique | length) == 64 and all(.[]; .packet == $packet)' "$evidence/packet.jsonl"
+          jq -r '.source_sha256 + "  src/" + (.module | gsub("\\."; "/")) + ".lean"' "$evidence/packet.jsonl" > "$evidence/sources.sha256"
+          cd "$RUNNER_TEMP/replay/lean"
+          sha256sum -c "$evidence/sources.sha256" > "$evidence/source-checks.log"
+
+      - name: Build every target in the granted packet
+        run: |
+          set -euo pipefail
+          evidence="$RUNNER_TEMP/evidence"
+          {
+            echo "packet_build_started=$(date -u +%FT%TZ)"
+            uname -sm
+            nproc
+            free -h
+            df -h "$RUNNER_TEMP"
+          } > "$evidence/resources.log"
+          export LEAN_NUM_THREADS=4
+          # Mirror the tracker transcript into the live Actions console.
+          tail -n +1 -F "$evidence/receipt/build.log" 2>/dev/null &
+          tail_pid=$!
+          trap 'kill "$tail_pid" 2>/dev/null || true' EXIT
+          /usr/bin/time -v -o "$evidence/time.log" python3 -u tracker/tasks.py build "$TARGET" "$RUNNER_TEMP/replay/lean" "$evidence/receipt" --fast-bundle
+          echo "packet_build_ended=$(date -u +%FT%TZ)" >> "$evidence/resources.log"
+
+      - name: Replay each of the 64 modules with the Lean kernel
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/replay/lean"
+          export ELAN_HOME="$RUNNER_TEMP/replay/elan" XDG_CACHE_HOME="$RUNNER_TEMP/replay/cache" LEAN_NUM_THREADS=2
+          evidence="$RUNNER_TEMP/evidence"
+          jq -r .module "$evidence/packet.jsonl" > "$evidence/kernel-targets.txt"
+          mapfile -t modules < "$evidence/kernel-targets.txt"
+          for ((offset=0; offset<${#modules[@]}; offset+=4)); do
+            elan run leanprover/lean4:v4.33.1 lake env leanchecker --verbose "${modules[@]:offset:4}" 2>&1 | tee -a "$evidence/kernel.log"
+          done
+          echo "kernel_replay_ended=$(date -u +%FT%TZ)" >> "$evidence/resources.log"
+
+      - name: Save the packet evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: ${{ inputs.packet }}-evidence
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 7
+          if-no-files-found: warn
